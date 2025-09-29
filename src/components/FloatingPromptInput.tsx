@@ -224,6 +224,7 @@ const FloatingPromptInputInner = (
   const [slashCommandQuery, setSlashCommandQuery] = useState("");
   const [cursorPosition, setCursorPosition] = useState(0);
   const [embeddedImages, setEmbeddedImages] = useState<string[]>([]);
+  const [pastedImages, setPastedImages] = useState<string[]>([]); // Store pasted base64 images separately
   const [dragActive, setDragActive] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -334,8 +335,9 @@ const FloatingPromptInputInner = (
     console.log('[useEffect] Prompt changed:', prompt);
     const imagePaths = extractImagePaths(prompt);
     console.log('[useEffect] Setting embeddedImages to:', imagePaths);
-    setEmbeddedImages(imagePaths);
-    
+    // Combine @mentioned images from prompt with pasted images
+    setEmbeddedImages([...imagePaths, ...pastedImages]);
+
     // Auto-resize on prompt change (handles paste, programmatic changes, etc.)
     if (textareaRef.current && !isExpanded) {
       textareaRef.current.style.height = 'auto';
@@ -344,7 +346,7 @@ const FloatingPromptInputInner = (
       setTextareaHeight(newHeight);
       textareaRef.current.style.height = `${newHeight}px`;
     }
-  }, [prompt, projectPath, isExpanded]);
+  }, [prompt, projectPath, isExpanded, pastedImages]);
 
   // Set up Tauri drag-drop event listener
   useEffect(() => {
@@ -685,7 +687,8 @@ const FloatingPromptInputInner = (
       return;
     }
 
-    if (prompt.trim() && !disabled) {
+    // Allow sending if there's either text or pasted images
+    if ((prompt.trim() || pastedImages.length > 0) && !disabled) {
       let finalPrompt = prompt.trim();
 
       // Append thinking phrase if not auto mode
@@ -694,9 +697,16 @@ const FloatingPromptInputInner = (
         finalPrompt = `${finalPrompt}.\n\n${thinkingMode.phrase}.`;
       }
 
+      // Append pasted images as @mentions to the prompt
+      if (pastedImages.length > 0) {
+        const imageMentions = pastedImages.map(img => `@"${img}"`).join(' ');
+        finalPrompt = finalPrompt ? `${finalPrompt} ${imageMentions}` : imageMentions;
+      }
+
       onSend(finalPrompt, selectedModel);
       setPrompt("");
       setEmbeddedImages([]);
+      setPastedImages([]); // Clear pasted images
       setTextareaHeight(48); // Reset height after sending
     }
   };
@@ -742,10 +752,16 @@ const FloatingPromptInputInner = (
     const items = e.clipboardData?.items;
     if (!items) return;
 
+    // Check if there are any images in the clipboard
+    const hasImage = Array.from(items).some(item => item.type.startsWith('image/'));
+
+    // If there's an image, prevent default paste behavior to avoid pasting base64 text
+    if (hasImage) {
+      e.preventDefault();
+    }
+
     for (const item of items) {
       if (item.type.startsWith('image/')) {
-        e.preventDefault();
-        
         // Get the image blob
         const blob = item.getAsFile();
         if (!blob) continue;
@@ -755,24 +771,23 @@ const FloatingPromptInputInner = (
           const reader = new FileReader();
           reader.onload = () => {
             const base64Data = reader.result as string;
-            
-            // Add the base64 data URL directly to the prompt
-            setPrompt(currentPrompt => {
-              // Use the data URL directly as the image reference
-              const mention = `@"${base64Data}"`;
-              const newPrompt = currentPrompt + (currentPrompt.endsWith(' ') || currentPrompt === '' ? '' : ' ') + mention + ' ';
-              
-              // Focus the textarea and move cursor to end
-              setTimeout(() => {
-                const target = isExpanded ? expandedTextareaRef.current : textareaRef.current;
-                target?.focus();
-                target?.setSelectionRange(newPrompt.length, newPrompt.length);
-              }, 0);
 
-              return newPrompt;
+            // Add image to pastedImages array (separate from prompt text)
+            setPastedImages(currentImages => {
+              // Check if this image is already in the list
+              if (currentImages.includes(base64Data)) {
+                return currentImages;
+              }
+              return [...currentImages, base64Data];
             });
+
+            // Focus the textarea
+            setTimeout(() => {
+              const target = isExpanded ? expandedTextareaRef.current : textareaRef.current;
+              target?.focus();
+            }, 0);
           };
-          
+
           reader.readAsDataURL(blob);
         } catch (error) {
           console.error('Failed to paste image:', error);
@@ -796,22 +811,20 @@ const FloatingPromptInputInner = (
   };
 
   const handleRemoveImage = (index: number) => {
-    // Remove the corresponding @mention from the prompt
+    // Remove the corresponding image
     const imagePath = embeddedImages[index];
-    
-    // For data URLs, we need to handle them specially since they're always quoted
+
+    // Check if it's a pasted image (base64 data URL)
     if (imagePath.startsWith('data:')) {
-      // Simply remove the exact quoted data URL
-      const quotedPath = `@"${imagePath}"`;
-      const newPrompt = prompt.replace(quotedPath, '').trim();
-      setPrompt(newPrompt);
+      // Remove from pastedImages array
+      setPastedImages(current => current.filter(img => img !== imagePath));
       return;
     }
-    
-    // For file paths, use the original logic
+
+    // For file paths in prompt, remove the @mention from the prompt text
     const escapedPath = imagePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const escapedRelativePath = imagePath.replace(projectPath + '/', '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    
+
     // Create patterns for both quoted and unquoted mentions
     const patterns = [
       // Quoted full path
@@ -1026,7 +1039,7 @@ const FloatingPromptInputInner = (
                   >
                     <Button
                       onClick={handleSend}
-                      disabled={!prompt.trim() || disabled}
+                      disabled={!(prompt.trim() || pastedImages.length > 0) || disabled}
                       size="default"
                       className="min-w-[60px]"
                     >
@@ -1044,10 +1057,10 @@ const FloatingPromptInputInner = (
         )}
       </AnimatePresence>
 
-      {/* Fixed Position Input Bar */}
+      {/* Input Bar */}
       <div
         className={cn(
-          "fixed bottom-0 left-0 right-0 z-40 bg-background/95 backdrop-blur-sm border-t border-border shadow-lg",
+          "bg-background/95 backdrop-blur-sm shadow-lg",
           dragActive && "ring-2 ring-primary ring-offset-2",
           className
         )}
@@ -1258,12 +1271,12 @@ const FloatingPromptInputInner = (
                     >
                       <Button
                         onClick={isLoading ? onCancel : handleSend}
-                        disabled={isLoading ? false : (!prompt.trim() || disabled)}
-                        variant={isLoading ? "destructive" : prompt.trim() ? "default" : "ghost"}
+                        disabled={isLoading ? false : (!(prompt.trim() || pastedImages.length > 0) || disabled)}
+                        variant={isLoading ? "destructive" : (prompt.trim() || pastedImages.length > 0) ? "default" : "ghost"}
                         size="icon"
                         className={cn(
                           "h-8 w-8 transition-all",
-                          prompt.trim() && !isLoading && "shadow-sm"
+                          (prompt.trim() || pastedImages.length > 0) && !isLoading && "shadow-sm"
                         )}
                       >
                         {isLoading ? (
