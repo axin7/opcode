@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use ignore::gitignore::GitignoreBuilder;
 
 
 /// Global state to track current Claude process
@@ -1321,6 +1322,70 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command, prompt: String, 
     Ok(())
 }
 
+/// Builds a gitignore matcher for the given directory by finding the project root
+/// and loading all .gitignore files from the root up to the given directory
+fn build_gitignore_matcher(dir: &PathBuf) -> Option<ignore::gitignore::Gitignore> {
+    // Find the project root (directory containing .git or as fallback, the given directory)
+    let project_root = find_project_root(dir)?;
+
+    let mut builder = GitignoreBuilder::new(&project_root);
+
+    // Walk up from project root and add all .gitignore files
+    let mut current = project_root.clone();
+    loop {
+        let gitignore_path = current.join(".gitignore");
+        if gitignore_path.exists() {
+            if let Some(e) = builder.add(&gitignore_path) {
+                log::warn!("Failed to load .gitignore at {:?}: {}", gitignore_path, e);
+            }
+        }
+
+        // Stop at the target directory
+        if current == *dir {
+            break;
+        }
+
+        // Move to subdirectory towards target
+        if let Ok(suffix) = dir.strip_prefix(&current) {
+            if let Some(first_component) = suffix.components().next() {
+                current = current.join(first_component);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    match builder.build() {
+        Ok(gitignore) => Some(gitignore),
+        Err(e) => {
+            log::warn!("Failed to build gitignore matcher: {}", e);
+            None
+        }
+    }
+}
+
+/// Finds the project root by looking for a .git directory
+fn find_project_root(start_dir: &PathBuf) -> Option<PathBuf> {
+    let mut current = start_dir.clone();
+
+    loop {
+        let git_dir = current.join(".git");
+        if git_dir.exists() {
+            return Some(current);
+        }
+
+        // Move up to parent directory
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            // No .git found, use the original directory
+            return Some(start_dir.clone());
+        }
+    }
+}
+
 
 /// Lists files and directories in a given path
 #[tauri::command]
@@ -1346,6 +1411,9 @@ pub async fn list_directory_contents(directory_path: String) -> Result<Vec<FileE
         return Err(format!("Path is not a directory: {}", directory_path));
     }
 
+    // Build gitignore matcher for the directory
+    let gitignore = build_gitignore_matcher(&path);
+
     let mut entries = Vec::new();
 
     let dir_entries =
@@ -1361,6 +1429,14 @@ pub async fn list_directory_contents(directory_path: String) -> Result<Vec<FileE
         // Skip hidden files/directories unless they are .claude directories
         if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
             if name.starts_with('.') && name != ".claude" {
+                continue;
+            }
+        }
+
+        // Check if the entry should be ignored according to .gitignore
+        if let Some(ref matcher) = gitignore {
+            if matcher.matched(&entry_path, metadata.is_dir()).is_ignore() {
+                log::debug!("Ignoring path (gitignore): {:?}", entry_path);
                 continue;
             }
         }
@@ -1427,7 +1503,10 @@ pub async fn search_files(base_path: String, query: String) -> Result<Vec<FileEn
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
 
-    search_files_recursive(&path, &path, &query_lower, &mut results, 0)?;
+    // Build gitignore matcher for the base path
+    let gitignore = build_gitignore_matcher(&path);
+
+    search_files_recursive(&path, &path, &query_lower, &mut results, 0, &gitignore)?;
 
     // Sort by relevance: exact matches first, then by name
     results.sort_by(|a, b| {
@@ -1453,6 +1532,7 @@ fn search_files_recursive(
     query: &str,
     results: &mut Vec<FileEntry>,
     depth: usize,
+    gitignore: &Option<ignore::gitignore::Gitignore>,
 ) -> Result<(), String> {
     // Limit recursion depth to prevent excessive searching
     if depth > 5 || results.len() >= 50 {
@@ -1465,6 +1545,9 @@ fn search_files_recursive(
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
         let entry_path = entry.path();
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("Failed to read metadata: {}", e))?;
 
         // Skip hidden files/directories
         if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
@@ -1472,12 +1555,16 @@ fn search_files_recursive(
                 continue;
             }
 
+            // Check if the entry should be ignored according to .gitignore
+            if let Some(ref matcher) = gitignore {
+                if matcher.matched(&entry_path, metadata.is_dir()).is_ignore() {
+                    log::debug!("Ignoring path (gitignore): {:?}", entry_path);
+                    continue;
+                }
+            }
+
             // Check if name matches query
             if name.to_lowercase().contains(query) {
-                let metadata = entry
-                    .metadata()
-                    .map_err(|e| format!("Failed to read metadata: {}", e))?;
-
                 let extension = if metadata.is_file() {
                     entry_path
                         .extension()
@@ -1509,7 +1596,7 @@ fn search_files_recursive(
                 }
             }
 
-            search_files_recursive(&entry_path, base_path, query, results, depth + 1)?;
+            search_files_recursive(&entry_path, base_path, query, results, depth + 1, gitignore)?;
         }
     }
 
