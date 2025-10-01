@@ -38,13 +38,44 @@ const TabPanel: React.FC<TabPanelProps> = ({ tab, isActive }) => {
   // Track screen when tab becomes active
   useScreenTracking(isActive ? tab.type : undefined, isActive ? tab.id : undefined);
   const [error, setError] = React.useState<string | null>(null);
-  
+
   // Load projects when tab becomes active and is of type 'projects'
   useEffect(() => {
     if (isActive && tab.type === 'projects') {
       loadProjects();
     }
   }, [isActive, tab.type]);
+
+  // Handle cmd+K shortcut to create new session with current project
+  useEffect(() => {
+    if (!isActive) return;
+
+    const handleNewSessionWithProject = () => {
+      if (tab.type === 'chat' && tab.initialProjectPath) {
+        // Clear current session and create new one with same project
+        const projectName = tab.initialProjectPath.split('/').pop() || 'Session';
+        updateTab(tab.id, {
+          type: 'chat',
+          title: projectName,
+          sessionId: undefined,
+          sessionData: undefined,
+          initialProjectPath: tab.initialProjectPath
+        });
+      } else if (tab.type === 'chat') {
+        // No project path, just create a new session
+        updateTab(tab.id, {
+          type: 'chat',
+          title: 'New Session',
+          sessionId: undefined,
+          sessionData: undefined,
+          initialProjectPath: undefined
+        });
+      }
+    };
+
+    window.addEventListener('new-session-with-project', handleNewSessionWithProject);
+    return () => window.removeEventListener('new-session-with-project', handleNewSessionWithProject);
+  }, [isActive, tab.type, tab.initialProjectPath, tab.id, updateTab]);
   
   const loadProjects = async () => {
     try {

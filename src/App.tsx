@@ -122,6 +122,11 @@ function AppContent() {
               window.dispatchEvent(new CustomEvent('switch-to-next-tab'));
             }
             break;
+          case 'k':
+            // cmd+K: clear messages and create new session with current project
+            e.preventDefault();
+            window.dispatchEvent(new CustomEvent('new-session-with-project'));
+            break;
           default:
             // Handle number keys 1-9
             if (e.key >= '1' && e.key <= '9') {
